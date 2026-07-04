@@ -1,5 +1,4 @@
-# better-edge-flow
-https://better-edge-flow-website.vercel.app/
+# better-edge-flow https://better-edge-flow-website.vercel.app/
 <p align="center">
   <img src="https://img.shields.io/npm/v/better-edge-flow?style=for-the-badge&color=6366f1&labelColor=1e1b4b" alt="npm version" />
   <img src="https://img.shields.io/npm/dm/better-edge-flow?style=for-the-badge&color=8b5cf6&labelColor=1e1b4b" alt="npm downloads" />
