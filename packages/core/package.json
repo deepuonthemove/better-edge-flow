@@ -1,0 +1,39 @@
+{
+  "name": "better-edge-flow",
+  "version": "1.0.0",
+  "description": "Zero-engine database-backed durable execution framework for serverless and edge runtimes",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "migrations",
+    "README.md"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./adapters/drizzle": {
+      "types": "./dist/adapters/drizzle/index.d.ts",
+      "default": "./dist/adapters/drizzle/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc"
+  },
+  "peerDependencies": {
+    "drizzle-orm": "^0.30.0"
+  },
+  "peerDependenciesMeta": {
+    "drizzle-orm": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "drizzle-orm": "^0.30.0"
+  },
+  "dependencies": {
+    "@opentelemetry/api": "^1.9.1"
+  }
+}
