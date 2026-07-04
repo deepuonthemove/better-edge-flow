@@ -43,6 +43,29 @@ npm install better-edge-flow
 
 ---
 
+## Concurrency, Lock Leasing, and Replay Safety
+
+In serverless and edge environments, preventing duplicate runs (split-brain executions) of the same workflow is a critical requirement. `better-edge-flow` implements a highly optimized, database-backed locking and replay-safety architecture designed to handle concurrent executions safely:
+
+### 1. Distributed Lease Concurrency Locks
+When starting or resuming a workflow execution, the engine acquires a database lock lease (default: 30 seconds) on the execution record:
+*   **PostgreSQL**: Uses atomic `SELECT ... FOR UPDATE` row-level locking.
+*   **SQLite**: Handled via native serialized database transactions.
+*   If a concurrent execution request (e.g., from duplicate webhooks, parallel cron sweepers, or client starts) attempts to run the same execution ID during the active lease, the lock acquisition fails immediately, and the execution is skipped.
+
+### 2. Step-Level Checkpointing & Idempotency
+If a worker crashes or fails mid-run and the lock lease expires, the execution state is safely recovered:
+*   The next trigger reload reads the entire step history from the database cache (`cachedSteps`).
+*   During code replay, the engine skips evaluating any step closure whose result is already recorded in the database, guaranteeing that non-idempotent steps (such as billing or email sends) execute exactly once.
+
+### 3. Worker-Failure Recovery (Autonomic Leases)
+If a serverless function terminates silently without releasing the lock (e.g., Lambda timeout or server crash), the lease naturally expires after 30 seconds. On the next cron timer check or external signal event, the engine will automatically acquire the expired lock lease and resume the execution from the last saved state.
+
+### 4. Idempotent Event Deduplication
+All webhook events support an optional `eventKey` which enforces a `UNIQUE` constraint at the database layer. If duplicate webhooks are delivered concurrently, only the first event is stored and processed, and the subsequent requests are safely deduplicated before any workflow execution is resumed.
+
+---
+
 ## Features
 
 - 🔁 **Durable Execution** — Workflows survive crashes, cold starts, and redeploys

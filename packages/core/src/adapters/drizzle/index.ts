@@ -346,7 +346,11 @@ export function drizzleAdapter(config: DrizzleAdapterConfig): BetterFlowAdapter 
 
     async acquireLock(id, leaseMs) {
       return await db.transaction(async (tx: any) => {
-        const result = await tx.select().from(executions).where(eq(executions.id, id));
+        let query = tx.select().from(executions).where(eq(executions.id, id));
+        if (dialect === "postgresql") {
+          query = query.for("update");
+        }
+        const result = await query;
         const row = result[0];
         if (!row) {
           return false;
