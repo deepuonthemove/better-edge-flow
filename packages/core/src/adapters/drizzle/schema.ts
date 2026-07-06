@@ -18,6 +18,7 @@ export function getDrizzleSchema(config: { dialect: "postgresql" | "sqlite"; tab
       output: jsonb("output"),
       error: jsonb("error"),
       timeout: timestamp("timeout"),
+      leaseUntil: timestamp("lease_until"),
       createdAt: timestamp("created_at").defaultNow().notNull(),
       updatedAt: timestamp("updated_at").defaultNow().notNull(),
     });
@@ -67,6 +68,7 @@ export function getDrizzleSchema(config: { dialect: "postgresql" | "sqlite"; tab
       output: sqliteText("output"),
       error: sqliteText("error"),
       timeout: sqliteInteger("timeout", { mode: "timestamp" }),
+      leaseUntil: sqliteInteger("lease_until", { mode: "timestamp" }),
       createdAt: sqliteInteger("created_at", { mode: "timestamp" }).notNull(),
       updatedAt: sqliteInteger("updated_at", { mode: "timestamp" }).notNull(),
     });

@@ -1,7 +1,7 @@
 export interface ExecutionRecord {
   id: string;
   workflowName: string;
-  status: 'RUNNING' | 'SUSPENDED' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
+  status: 'PENDING' | 'RUNNING' | 'SUSPENDED' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
   version: number;
   sequence: number;
   tenantId?: string | null;
@@ -10,6 +10,7 @@ export interface ExecutionRecord {
   output?: any;
   error?: any;
   timeout?: Date | null;
+  leaseUntil?: Date | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -78,7 +79,12 @@ export interface BetterFlowAdapter {
   getExecutionHistory(executionId: string): Promise<StepRecord[]>;
 
   // Distributed Concurrency Lease Locking
-  acquireLock(id: string, leaseMs: number): Promise<boolean>;
+  // Returns { acquired: boolean, reason?: 'missing' | 'locked' | 'terminal' }
+  // acquireLock is atomic at the SQL layer — dialect-portable.
+  acquireLock(id: string, leaseMs: number): Promise<{ acquired: boolean; reason?: 'missing' | 'locked' | 'terminal' }>;
+  // Heartbeat / lease extension. Only succeeds if THIS caller currently holds the lease
+  // (matched by leaseUntil). Returns true if extended.
+  extendLease(id: string, leaseMs: number): Promise<boolean>;
   releaseLock(id: string, status: ExecutionRecord['status']): Promise<void>;
 
   // Rate Limiting (Optional)

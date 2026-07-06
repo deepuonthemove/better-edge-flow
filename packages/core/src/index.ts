@@ -62,10 +62,14 @@ export class BetterFlow<TEvents extends Record<string, any> = Record<string, any
 
   /**
    * Starts a new workflow execution.
+   *
+   * Idempotent on `executionId`: if a row already exists for the supplied id we
+   * return that id instead of throwing on the PK violation. This makes client
+   * retries of the same webhook safe — they no longer surface as 500s.
    */
   async start(
-    workflowName: string, 
-    input: any, 
+    workflowName: string,
+    input: any,
     optionsOrId?: string | { executionId?: string; tenantId?: string; namespace?: string; timeout?: string | number }
   ): Promise<string> {
     let executionId: string = crypto.randomUUID();
@@ -93,16 +97,42 @@ export class BetterFlow<TEvents extends Record<string, any> = Record<string, any
       timeout = new Date(Date.now() + parseDuration(timeoutVal));
     }
 
-    await this.adapter.createExecution({
-      id: executionId,
-      workflowName,
-      status: "RUNNING",
-      version,
-      tenantId,
-      namespace,
-      input,
-      timeout
-    });
+    try {
+      await this.adapter.createExecution({
+        id: executionId,
+        workflowName,
+        status: "PENDING",
+        version,
+        tenantId,
+        namespace,
+        input,
+        timeout
+      });
+    } catch (err: any) {
+      // PK / unique violation = executionId already exists. Treat as idempotent:
+      // return the existing id without re-running. Caller (HTTP handler, webhook
+      // retry, etc.) gets the same executionId back instead of a 500.
+      const isUniqueViolation =
+        err?.message?.includes("UNIQUE") ||
+        err?.message?.includes("unique") ||
+        err?.message?.includes("constraint") ||
+        err?.message?.includes("PRIMARY KEY") ||
+        err?.code === "23505" ||
+        err?.code === "SQLITE_CONSTRAINT_PRIMARYKEY" ||
+        err?.code === "SQLITE_CONSTRAINT_UNIQUE";
+
+      if (isUniqueViolation) {
+        const existing = await this.adapter.getExecution(executionId);
+        if (existing && existing.workflowName === workflowName) {
+          return executionId;
+        }
+        // Mismatch: caller reused an id that belongs to a different workflow. Bubble up.
+        throw new Error(
+          `Execution "${executionId}" already exists with workflowName "${existing?.workflowName}", cannot reuse for "${workflowName}".`
+        );
+      }
+      throw err;
+    }
 
     await this.runExecution(executionId, fn, input);
     return executionId;
@@ -140,23 +170,78 @@ export class BetterFlow<TEvents extends Record<string, any> = Record<string, any
 
   /**
    * Internal wrapper to run the execution replay loop and catch suspension vs failures.
+   *
+   * Locking model (post-fix):
+   *   - acquireLock is a single atomic conditional UPDATE — dialect-portable.
+   *   - A heartbeat setInterval extends the lease while execution is in flight, so
+   *     long-running activities (longer than LEASE_MS) don't get re-claimed by a
+   *     concurrent worker.
+   *   - releaseLock unconditionally drops the lease (leaseUntil = null), so a
+   *     suspended workflow is immediately re-acquirable without waiting for the
+   *     lease to expire.
+   *   - Lock failure (already running / terminal / missing row) is logged with a
+   *     structured reason and emitted as a span event so operators can debug.
    */
   private async runExecution(executionId: string, fn: WorkflowFn<any, any, TEvents>, input: any): Promise<void> {
     const LEASE_MS = 30000; // 30 seconds lock lease
-    const locked = await this.adapter.acquireLock(executionId, LEASE_MS);
-    if (!locked) {
-      console.warn(`[Better-Flow] Execution "${executionId}" is currently locked. Skipping execution.`);
+    const HEARTBEAT_MS = Math.max(1000, Math.floor(LEASE_MS / 3)); // ~10s, min 1s
+    const lockResult = await this.adapter.acquireLock(executionId, LEASE_MS);
+
+    // Observability for lock acquisition outcomes. We emit a dedicated OTel span
+    // so the timing and correlation of lock attempts is visible in any
+    // registered exporter. The structured `console.*` calls below carry the
+    // reason for failure (missing / locked / terminal).
+    const tracer = trace.getTracer("better-flow");
+    tracer.startActiveSpan("better-flow.acquireLock", (span) => {
+      span.setAttribute("better-flow.execution_id", executionId);
+      span.setAttribute("better-flow.acquired", lockResult.acquired);
+      span.setAttribute("better-flow.lock_reason", lockResult.reason ?? "acquired");
+      span.end();
+    });
+
+    if (!lockResult.acquired) {
+      // Structured logging on lock failure so operators can debug:
+      //   - missing  → row was deleted out from under us
+      //   - terminal → resume() on a completed/failed/cancelled execution (normal cron sweep)
+      //   - locked   → another worker is currently running this execution
+      const reason = lockResult.reason ?? "unknown";
+      if (reason === "missing") {
+        console.warn(`[Better-Flow] Execution "${executionId}" does not exist; skipping run.`);
+      } else if (reason === "terminal") {
+        console.info(`[Better-Flow] Execution "${executionId}" already terminal; skipping run.`);
+      } else {
+        console.warn(
+          `[Better-Flow] Execution "${executionId}" is currently locked by another worker; skipping run.`
+        );
+      }
       return;
     }
 
     const execution = await this.adapter.getExecution(executionId);
     if (!execution) {
+      // Edge case: row vanished between acquireLock and getExecution (e.g. manual
+      // DELETE). releaseLock now no-ops on missing rows safely.
       await this.adapter.releaseLock(executionId, "FAILED");
       return;
     }
 
+    // Start the heartbeat BEFORE we hand off to the handler. It extends the
+    // lease every HEARTBEAT_MS while execution runs. The interval is cleared
+    // in the `finally` block below, no matter how the execution ends.
+    const heartbeat = setInterval(() => {
+      // Fire-and-forget; extendLease failure is fine — it just means somebody
+      // else owns the lease now and our next attempt will detect that.
+      this.adapter.extendLease(executionId, LEASE_MS).catch((err) => {
+        console.warn(`[Better-Flow] Heartbeat extendLease failed for "${executionId}":`, err);
+      });
+    }, HEARTBEAT_MS);
+    // Don't keep the Node event loop alive solely for heartbeats in serverless —
+    // they should be cheap and die with the function.
+    if (typeof (heartbeat as any).unref === "function") {
+      (heartbeat as any).unref();
+    }
+
     const ctx = new WorkflowContextImpl<TEvents>(executionId, this.adapter, this.config);
-    const tracer = trace.getTracer("better-flow");
 
     await tracer.startActiveSpan(`workflow:${execution.workflowName}`, async (span) => {
       span.setAttribute("better-flow.execution_id", executionId);
@@ -164,7 +249,7 @@ export class BetterFlow<TEvents extends Record<string, any> = Record<string, any
 
       try {
         await ctx.initialize(); // Pre-load all step records in memory to protect against replication lag
-        
+
         // Onion-model inbound interceptor chain wrapping
         let next = async () => {
           return await fn(ctx, input);
@@ -184,7 +269,7 @@ export class BetterFlow<TEvents extends Record<string, any> = Record<string, any
         }
 
         const output = await next();
-        
+
         // Flush any pending deferred local activity steps before completion
         await ctx.flushPendingLocalSteps();
 
@@ -207,12 +292,13 @@ export class BetterFlow<TEvents extends Record<string, any> = Record<string, any
         } else {
           span.recordException(err);
           span.setStatus({ code: SpanStatusCode.ERROR, message: err.message });
-          
+
           // Unhandled failure: trigger Saga compensations rollback!
+          console.error(`[Better-Flow DEBUG] Non-suspended error in runExecution for "${executionId}":`, err);
           try {
             console.warn(`[Better-Flow] Execution "${executionId}" failed. Triggering Saga rollbacks.`);
             await ctx.runCompensations();
-            
+
             await this.adapter.updateExecution(executionId, {
               error: { message: err.message, stack: err.stack }
             });
@@ -230,7 +316,7 @@ export class BetterFlow<TEvents extends Record<string, any> = Record<string, any
             } else {
               // Saga rollback itself crashed permanently
               await this.adapter.updateExecution(executionId, {
-                error: { 
+                error: {
                   message: `Workflow failed: ${err.message}. Rollback failed: ${rollbackErr.message}`,
                   stack: rollbackErr.stack
                 }
@@ -245,6 +331,7 @@ export class BetterFlow<TEvents extends Record<string, any> = Record<string, any
           }
         }
       } finally {
+        clearInterval(heartbeat);
         span.end();
       }
     });

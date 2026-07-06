@@ -21,6 +21,7 @@ CREATE TABLE `bf_executions` (
 	`output` text,
 	`error` text,
 	`timeout` integer,
+	`lease_until` integer,
 	`created_at` integer NOT NULL,
 	`updated_at` integer NOT NULL
 );

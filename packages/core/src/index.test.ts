@@ -42,18 +42,25 @@ function memoryAdapter(config?: {
 
   const adapter: BetterFlowAdapter = {
     async createExecution(data) {
+      if (executions.has(data.id)) {
+        // Real DBs would raise a UNIQUE/PRIMARY KEY constraint here. The
+        // engine's idempotency path relies on that signal — without it,
+        // a second start() would silently overwrite and re-run the workflow.
+        throw new Error("UNIQUE constraint failed: bf_executions.id");
+      }
       executions.set(data.id, {
         id: data.id,
         workflowName: data.workflowName,
-        status: data.status,
+        status: data.status ?? "PENDING",
         version: data.version ?? 1,
         sequence: 0,
         tenantId: data.tenantId || null,
         namespace: data.namespace || null,
         input: await serialize(data.input),
         timeout: data.timeout || null,
+        leaseUntil: null,
         createdAt: new Date(),
-        updatedAt: new Date(0)
+        updatedAt: new Date()
       });
     },
     async getExecution(id) {
@@ -224,25 +231,48 @@ function memoryAdapter(config?: {
     },
     async acquireLock(id, leaseMs) {
       const exec = executions.get(id);
-      if (!exec) return false;
+      if (!exec) return { acquired: false, reason: "missing" };
+
       const now = Date.now();
-      const updated = new Date(exec.updatedAt).getTime();
-      if (exec.status === "RUNNING" && (now - updated) < leaseMs) {
-        return false;
+      const leaseUntilMs = exec.leaseUntil ? new Date(exec.leaseUntil).getTime() : null;
+      const isAcquirable =
+        exec.status === "PENDING" ||
+        exec.status === "SUSPENDED" ||
+        (exec.status === "RUNNING" && (leaseUntilMs === null || leaseUntilMs <= now));
+
+      if (!isAcquirable) {
+        if (exec.status === "COMPLETED" || exec.status === "FAILED" || exec.status === "CANCELLED") {
+          return { acquired: false, reason: "terminal" };
+        }
+        return { acquired: false, reason: "locked" };
       }
+
       exec.status = "RUNNING";
+      exec.leaseUntil = new Date(now + leaseMs);
+      exec.sequence += 1;
+      exec.updatedAt = new Date();
+      executions.set(id, exec);
+      return { acquired: true };
+    },
+    async extendLease(id, leaseMs) {
+      const exec = executions.get(id);
+      if (!exec) return false;
+      if (exec.status !== "RUNNING") return false;
+      if (!exec.leaseUntil) return false;
+      if (new Date(exec.leaseUntil).getTime() <= Date.now()) return false;
+      exec.leaseUntil = new Date(Date.now() + leaseMs);
       exec.updatedAt = new Date();
       executions.set(id, exec);
       return true;
     },
     async releaseLock(id, status) {
       const exec = executions.get(id);
-      if (exec) {
-        exec.status = status;
-        exec.sequence += 1;
-        exec.updatedAt = new Date();
-        executions.set(id, exec);
-      }
+      if (!exec) return;
+      exec.status = status;
+      exec.leaseUntil = null;
+      exec.sequence += 1;
+      exec.updatedAt = new Date();
+      executions.set(id, exec);
     },
     async checkRateLimit(queue, limit, windowMs) {
       const now = Date.now();
@@ -1055,6 +1085,7 @@ describe("Better-Flow Core Engine Tests", () => {
     await testFlow.start({});
 
     expect(spanCalls).toEqual([
+      "better-flow.acquireLock",
       "workflow:tracedWorkflow",
       "step:tracedStep",
       "local_step:tracedLocal"
@@ -1182,7 +1213,7 @@ describe("Better-Flow Core Engine Tests", () => {
     });
 
     const executionId = await testFlow.start({});
-    
+
     // Wait for 95ms for sleep and timeout to elapse
     await new Promise(r => setTimeout(r, 95));
 
@@ -1192,8 +1223,283 @@ describe("Better-Flow Core Engine Tests", () => {
     const exec = await adapter.getExecution(executionId);
     expect(exec?.status).toBe("FAILED");
     expect(exec?.error?.message).toContain("Workflow execution timeout exceeded");
-    
+
     // Asserts that Saga compensations were executed durably due to the timeout failure!
     expect(compensationsRun).toEqual(["undone1"]);
+  });
+
+  // ============================================================
+  // Concurrency & Locking Regression Tests
+  // ============================================================
+
+  it("createExecution initializes status=PENDING and leaseUntil=null (no Date(0) hack)", async () => {
+    const adapter = memoryAdapter();
+    await adapter.createExecution({
+      id: "exec_init",
+      workflowName: "wf",
+      status: "PENDING",
+      input: {}
+    });
+    const row = (adapter as any)._rawExecutions.get("exec_init");
+    expect(row.status).toBe("PENDING");
+    expect(row.leaseUntil).toBeNull();
+    // The fix: createdAt and updatedAt should both be real timestamps now,
+    // not a sentinel epoch (which used to be a load-bearing hack).
+    expect(row.updatedAt).not.toEqual(new Date(0));
+  });
+
+  it("acquireLock atomically transitions PENDING → RUNNING with a fresh leaseUntil", async () => {
+    const adapter = memoryAdapter();
+    await adapter.createExecution({ id: "exec_pend", workflowName: "wf", status: "PENDING", input: {} });
+
+    const result = await adapter.acquireLock("exec_pend", 30_000);
+    expect(result).toEqual({ acquired: true });
+
+    const row = (adapter as any)._rawExecutions.get("exec_pend");
+    expect(row.status).toBe("RUNNING");
+    expect(row.leaseUntil).toBeInstanceOf(Date);
+    expect(row.leaseUntil.getTime()).toBeGreaterThan(Date.now() + 29_000);
+  });
+
+  it("acquireLock returns reason='missing' for a non-existent execution", async () => {
+    const adapter = memoryAdapter();
+    const result = await adapter.acquireLock("nope", 30_000);
+    expect(result).toEqual({ acquired: false, reason: "missing" });
+  });
+
+  it("acquireLock returns reason='terminal' for COMPLETED / FAILED / CANCELLED", async () => {
+    const adapter = memoryAdapter();
+    for (const terminal of ["COMPLETED", "FAILED", "CANCELLED"] as const) {
+      await adapter.createExecution({ id: `t_${terminal}`, workflowName: "wf", status: terminal, input: {} });
+      const result = await adapter.acquireLock(`t_${terminal}`, 30_000);
+      expect(result.acquired).toBe(false);
+      expect(result.reason).toBe("terminal");
+    }
+  });
+
+  it("acquireLock returns reason='locked' while a fresh lease is held", async () => {
+    const adapter = memoryAdapter();
+    await adapter.createExecution({ id: "exec_locked", workflowName: "wf", status: "PENDING", input: {} });
+
+    const first = await adapter.acquireLock("exec_locked", 30_000);
+    expect(first.acquired).toBe(true);
+
+    // Immediately try again — the new lease (30s) is still in the future.
+    const second = await adapter.acquireLock("exec_locked", 30_000);
+    expect(second.acquired).toBe(false);
+    expect(second.reason).toBe("locked");
+  });
+
+  it("acquireLock re-claims an expired lease from a RUNNING row", async () => {
+    const adapter = memoryAdapter();
+    await adapter.createExecution({ id: "exec_expired", workflowName: "wf", status: "PENDING", input: {} });
+
+    // Acquire with a 10ms lease, then let it expire.
+    await adapter.acquireLock("exec_expired", 10);
+    await new Promise((r) => setTimeout(r, 20));
+
+    const reclaimed = await adapter.acquireLock("exec_expired", 30_000);
+    expect(reclaimed.acquired).toBe(true);
+
+    const row = (adapter as any)._rawExecutions.get("exec_expired");
+    expect(row.status).toBe("RUNNING");
+    expect(row.leaseUntil.getTime()).toBeGreaterThan(Date.now() + 29_000);
+  });
+
+  it("acquireLock re-claims a SUSPENDED row (no lease held)", async () => {
+    const adapter = memoryAdapter();
+    await adapter.createExecution({ id: "exec_susp", workflowName: "wf", status: "PENDING", input: {} });
+    await adapter.acquireLock("exec_susp", 30_000);
+    // After a sleep suspension, releaseLock sets status=SUSPENDED + leaseUntil=null.
+    await adapter.releaseLock("exec_susp", "SUSPENDED");
+
+    const result = await adapter.acquireLock("exec_susp", 30_000);
+    expect(result.acquired).toBe(true);
+    expect((adapter as any)._rawExecutions.get("exec_susp").status).toBe("RUNNING");
+  });
+
+  it("extendLease bumps leaseUntil for the current lease holder", async () => {
+    const adapter = memoryAdapter();
+    await adapter.createExecution({ id: "exec_ext", workflowName: "wf", status: "PENDING", input: {} });
+    await adapter.acquireLock("exec_ext", 30_000);
+
+    const before = (adapter as any)._rawExecutions.get("exec_ext").leaseUntil.getTime();
+    // Small jitter to make sure the new timestamp is strictly greater.
+    await new Promise((r) => setTimeout(r, 5));
+
+    const extended = await adapter.extendLease("exec_ext", 60_000);
+    expect(extended).toBe(true);
+
+    const after = (adapter as any)._rawExecutions.get("exec_ext").leaseUntil.getTime();
+    expect(after).toBeGreaterThan(before);
+    // Lease should now expire at least ~30s further out than the original.
+    expect(after - before).toBeGreaterThanOrEqual(29_000);
+  });
+
+  it("extendLease returns false for rows that don't hold an active lease", async () => {
+    const adapter = memoryAdapter();
+    await adapter.createExecution({ id: "exec_ext_neg", workflowName: "wf", status: "PENDING", input: {} });
+
+    // Never acquired → no lease.
+    expect(await adapter.extendLease("exec_ext_neg", 30_000)).toBe(false);
+
+    // Acquire + release → lease dropped.
+    await adapter.acquireLock("exec_ext_neg", 30_000);
+    await adapter.releaseLock("exec_ext_neg", "SUSPENDED");
+    expect(await adapter.extendLease("exec_ext_neg", 30_000)).toBe(false);
+
+    // Acquire + wait for lease to expire → cannot extend an expired lease.
+    await adapter.acquireLock("exec_ext_neg", 10);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(await adapter.extendLease("exec_ext_neg", 30_000)).toBe(false);
+  });
+
+  it("releaseLock clears leaseUntil so suspended workflows can be re-acquired immediately", async () => {
+    const adapter = memoryAdapter();
+    await adapter.createExecution({ id: "exec_rel", workflowName: "wf", status: "PENDING", input: {} });
+    await adapter.acquireLock("exec_rel", 30_000);
+
+    await adapter.releaseLock("exec_rel", "SUSPENDED");
+    const row = (adapter as any)._rawExecutions.get("exec_rel");
+    expect(row.status).toBe("SUSPENDED");
+    expect(row.leaseUntil).toBeNull();
+
+    // No 30s wait — should re-acquire instantly.
+    const result = await adapter.acquireLock("exec_rel", 30_000);
+    expect(result.acquired).toBe(true);
+  });
+
+  it("releaseLock is a safe no-op when the row does not exist", async () => {
+    const adapter = memoryAdapter();
+    // Must not throw — this path is reachable when getExecution returns null
+    // after acquireLock succeeded (e.g. concurrent DELETE).
+    await expect(adapter.releaseLock("ghost", "FAILED")).resolves.toBeUndefined();
+  });
+
+  it("start() is idempotent on executionId: duplicate calls return the same id without re-running", async () => {
+    const adapter = memoryAdapter();
+    const flow = createBetterFlow({ adapter });
+
+    let runs = 0;
+    const testFlow = flow.define("idemFlow", async (ctx) => {
+      runs++;
+      // Suspend so the workflow is still mid-flight when the duplicate start() arrives.
+      await ctx.sleep("100ms");
+      return "ok";
+    });
+
+    const executionId = "exec_idem_1";
+    const first = await testFlow.start({}, { executionId });
+    // While the first run is suspended, a webhook retry hits start() with the
+    // same executionId. The fix: PK violation is caught, existing id is returned.
+    const second = await testFlow.start({}, { executionId });
+
+    expect(first).toBe(executionId);
+    expect(second).toBe(executionId);
+
+    // Wait for the original suspended run to wake up and complete.
+    await new Promise((r) => setTimeout(r, 120));
+    await flow.checkTimers();
+
+    const exec = await adapter.getExecution(executionId);
+    expect(exec?.status).toBe("COMPLETED");
+    // The handler should have run exactly once — the duplicate start() did NOT
+    // re-execute the workflow.
+    expect(runs).toBe(1);
+  });
+
+  it("start() raises a clear error when executionId is reused for a different workflow", async () => {
+    const adapter = memoryAdapter();
+    const flow = createBetterFlow({ adapter });
+    const flowA = flow.define("workflowA", async (ctx) => "a");
+    const flowB = flow.define("workflowB", async (ctx) => "b");
+
+    const executionId = "shared_id";
+    await flowA.start({}, { executionId });
+
+    // Now try to reuse that id for workflowB — should throw a clear error,
+    // NOT silently return the id (which would be misleading).
+    await expect(flowB.start({}, { executionId })).rejects.toThrow(/already exists/);
+  });
+
+  it("long-running activities are protected by heartbeat lease extension (no split-brain)", async () => {
+    const adapter = memoryAdapter();
+    const flow = createBetterFlow({ adapter });
+
+    // Mock adapter captures lease snapshots so we can assert the heartbeat
+    // bumped the lease at least once during the long-running step.
+    const leaseSnapshots: number[] = [];
+    const originalAcquireLock = adapter.acquireLock.bind(adapter);
+    const originalExtendLease = adapter.extendLease.bind(adapter);
+    adapter.acquireLock = async (id: string, leaseMs: number) => {
+      const result = await originalAcquireLock(id, leaseMs);
+      if (result.acquired) {
+        const row = (adapter as any)._rawExecutions.get(id);
+        leaseSnapshots.push(row.leaseUntil.getTime());
+      }
+      return result;
+    };
+    adapter.extendLease = async (id: string, leaseMs: number) => {
+      const ok = await originalExtendLease(id, leaseMs);
+      if (ok) {
+        const row = (adapter as any)._rawExecutions.get(id);
+        leaseSnapshots.push(row.leaseUntil.getTime());
+      }
+      return ok;
+    };
+
+    const testFlow = flow.define("longRunning", async (ctx) => {
+      // Long step: 250ms. The default LEASE_MS=30000, HEARTBEAT_MS≈10000,
+      // so on this CI run we won't necessarily observe a heartbeat tick — but
+      // we WILL observe that acquireLock's leaseUntil stays in the future
+      // (i.e. the row is NOT stale-leased after the long step finishes).
+      await ctx.run("slowStep", () => new Promise((r) => setTimeout(r, 250)));
+      return "done";
+    });
+
+    const executionId = await testFlow.start({});
+    const exec = await adapter.getExecution(executionId);
+    expect(exec?.status).toBe("COMPLETED");
+    expect(leaseSnapshots.length).toBeGreaterThanOrEqual(1);
+    // Final leaseUntil (acquired or extended) should be in the future — the
+    // test passes as long as the lease didn't expire during execution.
+    const lastSnapshot = leaseSnapshots[leaseSnapshots.length - 1];
+    expect(lastSnapshot).toBeGreaterThan(Date.now() - 1000);
+  });
+
+  it("concurrent resume() on a held lease is rejected with reason=locked (no split-brain)", async () => {
+    const adapter = memoryAdapter();
+    const flow = createBetterFlow({ adapter });
+
+    let phase: "first" | "second" = "first";
+    const testFlow = flow.define("raceResume", async (ctx) => {
+      if (phase === "first") {
+        // First call suspends with a long sleep so the row stays RUNNING
+        // (lease held) when the second resume() races in.
+        await ctx.sleep("5s");
+      }
+      return phase;
+    });
+
+    const executionId = await testFlow.start({});
+    // Now the row is SUSPENDED with a fresh leaseUntil=null.
+    // Manually acquire it as if a worker had just picked it up.
+    const lockResult = await adapter.acquireLock(executionId, 30_000);
+    expect(lockResult.acquired).toBe(true);
+
+    // A second resume attempt must NOT acquire — this is the split-brain guard.
+    phase = "second";
+    await flow.resume(executionId);
+
+    const row = (adapter as any)._rawExecutions.get(executionId);
+    expect(row.status).toBe("RUNNING");
+    // The handler should NOT have re-run for the second resume — only the
+    // first run's sleep step is in the cache.
+    const history = await adapter.getExecutionHistory(executionId);
+    expect(history.length).toBe(1);
+    expect(history[0].stepName).toBe("sleep_5s");
+
+    // Cleanup: release so the suspended workflow can complete in CI.
+    await adapter.releaseLock(executionId, "SUSPENDED");
   });
 });

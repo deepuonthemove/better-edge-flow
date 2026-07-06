@@ -21,6 +21,7 @@ CREATE TABLE "bf_executions" (
 	"output" jsonb,
 	"error" jsonb,
 	"timeout" timestamp,
+	"lease_until" timestamp,
 	"created_at" timestamp DEFAULT now() NOT NULL,
 	"updated_at" timestamp DEFAULT now() NOT NULL
 );

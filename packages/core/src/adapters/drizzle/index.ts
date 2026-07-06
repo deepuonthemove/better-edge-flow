@@ -1,4 +1,4 @@
-import { and, eq, lte, desc, sql, or } from "drizzle-orm";
+import { and, eq, lte, desc, sql, or, isNull, gt } from "drizzle-orm";
 import { BetterFlowAdapter, ExecutionRecord, StepRecord } from "../../types.js";
 import { getDrizzleSchema } from "./schema.js";
 
@@ -70,18 +70,22 @@ export function drizzleAdapter(config: DrizzleAdapterConfig): BetterFlowAdapter 
 
   return {
     async createExecution(data) {
+      // Always write status='PENDING' and leaseUntil=null. acquireLock is the only writer
+      // of status='RUNNING' + a real leaseUntil. This removes the old "new Date(0) hack"
+      // where the engine relied on a sentinel timestamp to pass the lease check.
       await db.insert(executions).values({
         id: data.id,
         workflowName: data.workflowName,
-        status: data.status,
+        status: "PENDING",
         version: data.version ?? 1,
         sequence: 0,
         tenantId: data.tenantId || null,
         namespace: data.namespace || null,
         input: await serialize(data.input),
         timeout: data.timeout || null,
+        leaseUntil: null,
         createdAt: new Date(),
-        updatedAt: new Date(0)
+        updatedAt: new Date()
       });
     },
 
@@ -345,34 +349,96 @@ export function drizzleAdapter(config: DrizzleAdapterConfig): BetterFlowAdapter 
     },
 
     async acquireLock(id, leaseMs) {
-      return await db.transaction(async (tx: any) => {
-        let query = tx.select().from(executions).where(eq(executions.id, id));
-        if (dialect === "postgresql") {
-          query = query.for("update");
-        }
-        const result = await query;
-        const row = result[0];
-        if (!row) {
-          return false;
-        }
+      // Atomic conditional update: claim the lease iff the row is in an acquirable state.
+      // We translate "acquirable" into a single SQL predicate so both PG and SQLite get
+      // the same guarantee without relying on dialect-specific row locks:
+      //   - status IN ('PENDING', 'SUSPENDED')          — never started, or paused
+      //   - status = 'RUNNING' AND lease_until <= now  — running but lease expired
+      //   - status = 'RUNNING' AND lease_until IS NULL — running without a lease (legacy rows)
+      // Terminal statuses ('COMPLETED', 'FAILED', 'CANCELLED') are never re-acquirable.
+      const now = new Date();
+      const leaseUntil = new Date(now.getTime() + leaseMs);
 
-        const now = Date.now();
-        const updatedAt = new Date(row.updatedAt).getTime();
+      const result = await db
+        .update(executions)
+        .set({
+          status: "RUNNING",
+          leaseUntil,
+          updatedAt: now,
+          sequence: sql`${executions.sequence} + 1`
+        })
+        .where(and(
+          eq(executions.id, id),
+          or(
+            eq(executions.status, "PENDING"),
+            eq(executions.status, "SUSPENDED"),
+            and(
+              eq(executions.status, "RUNNING"),
+              or(
+                isNull(executions.leaseUntil),
+                lte(executions.leaseUntil, now)
+              )
+            )
+          )
+        ))
+        .returning({ id: executions.id });
 
-        if (row.status === "RUNNING" && (now - updatedAt) < leaseMs) {
-          return false;
-        }
+      if (result.length > 0) {
+        return { acquired: true };
+      }
 
-        await tx.update(executions)
-          .set({ status: "RUNNING", updatedAt: new Date() })
-          .where(eq(executions.id, id));
-        return true;
-      });
+      // UPDATE matched zero rows — figure out *why* so the caller can log it.
+      const row = await db
+        .select({
+          status: executions.status,
+          leaseUntil: executions.leaseUntil
+        })
+        .from(executions)
+        .where(eq(executions.id, id))
+        .limit(1);
+
+      const current = row[0];
+      if (!current) {
+        return { acquired: false, reason: "missing" };
+      }
+      if (current.status === "COMPLETED" || current.status === "FAILED" || current.status === "CANCELLED") {
+        return { acquired: false, reason: "terminal" };
+      }
+      return { acquired: false, reason: "locked" };
+    },
+
+    async extendLease(id, leaseMs) {
+      // Conditional extend: only the current lease holder can extend.
+      // Matches iff lease_until is in the future AND belongs to us (still RUNNING).
+      const newLeaseUntil = new Date(Date.now() + leaseMs);
+      const result = await db
+        .update(executions)
+        .set({ leaseUntil: newLeaseUntil, updatedAt: new Date() })
+        .where(and(
+          eq(executions.id, id),
+          eq(executions.status, "RUNNING"),
+          gt(executions.leaseUntil, new Date())
+        ))
+        .returning({ id: executions.id });
+      return result.length > 0;
     },
 
     async releaseLock(id, status) {
+      // Guard: silently no-op if the row doesn't exist (engine path sometimes hits this).
+      const existing = await db
+        .select({ id: executions.id })
+        .from(executions)
+        .where(eq(executions.id, id))
+        .limit(1);
+      if (existing.length === 0) return;
+
       await db.update(executions)
-        .set({ status, sequence: sql`${executions.sequence} + 1`, updatedAt: new Date() })
+        .set({
+          status,
+          leaseUntil: null,
+          sequence: sql`${executions.sequence} + 1`,
+          updatedAt: new Date()
+        })
         .where(eq(executions.id, id));
     },
 
